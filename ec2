@@ -222,6 +222,12 @@ class EC2Manager:
             ) as progress:
                 progress.add_task(description="Launching instance...", total=None)
                 
+                # Get AMI details to use in instance name
+                ami_details = self.ec2.describe_images(ImageIds=[ami_id])['Images'][0]
+                ami_name = ami_details.get('Name', 'Unknown')
+                current_date = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+                instance_name = f"{ami_name}-restored-{current_date}"
+
                 response = self.ec2.run_instances(
                     ImageId=ami_id,
                     InstanceType=instance_type,
@@ -230,6 +236,7 @@ class EC2Manager:
                     TagSpecifications=[{
                         'ResourceType': 'instance',
                         'Tags': [
+                            {'Key': 'Name', 'Value': instance_name},
                             {'Key': 'CreatedBy', 'Value': 'ec2-cli'},
                             {'Key': 'SourceAMI', 'Value': ami_id},
                             {'Key': 'CreatedAt', 'Value': datetime.now().isoformat()}
