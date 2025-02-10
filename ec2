@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+import click
+import boto3
+import logging
+import sys
+import re
+from datetime import datetime
+from typing import Optional, Dict, Any
+from botocore.exceptions import ClientError, ValidationError
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import Progress, SpinnerColumn, TextColumn
+import json
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    handlers=[RichHandler(rich_tracebacks=True)]
+)
+logger = logging.getLogger("ec2-cli")
+console = Console()
+
+class EC2ValidationError(Exception):
+    """Custom exception for EC2 validation errors"""
+    pass
+
+class EC2Manager:
+    """Manages EC2 operations including backup and restore"""
+    
+    INSTANCE_ID_PATTERN = re.compile(r'^i-[a-z0-9]{17}$')
+    AMI_ID_PATTERN = re.compile(r'^ami-[a-z0-9]{17}$')
+    
+    def __init__(self):
+        """Initialize EC2 manager with boto3 client"""
+        try:
+            self.ec2 = boto3.client('ec2')
+            self.ec2_resource = boto3.resource('ec2')
+        except Exception as e:
+            logger.error(f"Failed to initialize AWS client: {str(e)}")
+            raise
+
+    def validate_instance_id(self, instance_id: str) -> bool:
+        """
+        Validate EC2 instance ID format and existence
+        
+        Args:
+            instance_id: The EC2 instance ID to validate
+            
+        Returns:
+            bool: True if instance exists and is valid
+            
+        Raises:
+            EC2ValidationError: If instance ID is invalid or instance doesn't exist
+        """
+        if not self.INSTANCE_ID_PATTERN.match(instance_id):
+            raise EC2ValidationError(f"Invalid instance ID format: {instance_id}")
+        
+        try:
+            self.ec2.describe_instances(InstanceIds=[instance_id])
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidInstanceID.NotFound':
+                raise EC2ValidationError(f"Instance not found: {instance_id}")
+            raise
+
+    def validate_ami_identifier(self, ami_identifier: str) -> str:
+        """
+        Validate AMI identifier and return AMI ID
+        
+        Args:
+            ami_identifier: Either AMI ID or name
+            
+        Returns:
+            str: Valid AMI ID
+            
+        Raises:
+            EC2ValidationError: If AMI identifier is invalid or AMI doesn't exist
+        """
+        try:
+            if self.AMI_ID_PATTERN.match(ami_identifier):
+                response = self.ec2.describe_images(ImageIds=[ami_identifier])
+                if not response['Images']:
+                    raise EC2ValidationError(f"AMI not found: {ami_identifier}")
+                return ami_identifier
+            else:
+                response = self.ec2.describe_images(
+                    Filters=[
+                        {'Name': 'name', 'Values': [ami_identifier]},
+                        {'Name': 'state', 'Values': ['available']}
+                    ],
+                    Owners=['self']
+                )
+                if not response['Images']:
+                    raise EC2ValidationError(f"No AMI found with name: {ami_identifier}")
+                return response['Images'][0]['ImageId']
+        except ClientError as e:
+            raise EC2ValidationError(f"Error validating AMI: {str(e)}")
+
+    def validate_instance_type(self, instance_type: str) -> bool:
+        """
+        Validate if instance type is valid
+        
+        Args:
+            instance_type: EC2 instance type
+            
+        Returns:
+            bool: True if instance type is valid
+            
+        Raises:
+            EC2ValidationError: If instance type is invalid
+        """
+        try:
+            response = self.ec2.describe_instance_types(InstanceTypes=[instance_type])
+            return bool(response['InstanceTypes'])
+        except ClientError:
+            raise EC2ValidationError(f"Invalid instance type: {instance_type}")
+
+    def get_instance_details(self, instance_id: str) -> Dict[str, Any]:
+        """
+        Get instance details including tags
+        
+        Args:
+            instance_id: EC2 instance ID
+            
+        Returns:
+            Dict containing instance details
+        """
+        try:
+            response = self.ec2.describe_instances(InstanceIds=[instance_id])
+            instance = response['Reservations'][0]['Instances'][0]
+            return {
+                'name': next((tag['Value'] for tag in instance.get('Tags', []) 
+                            if tag['Key'] == 'Name'), instance_id),
+                'state': instance['State']['Name'],
+                'instance_type': instance['InstanceType'],
+                'launch_time': instance['LaunchTime'].isoformat()
+            }
+        except (ClientError, IndexError) as e:
+            logger.error(f"Error getting instance details: {str(e)}")
+            return {}
+
+    def create_ami(self, instance_id: str) -> Optional[str]:
+        """
+        Create AMI from EC2 instance
+        
+        Args:
+            instance_id: Source EC2 instance ID
+            
+        Returns:
+            Optional[str]: AMI ID if successful, None otherwise
+        """
+        try:
+            self.validate_instance_id(instance_id)
+            instance_details = self.get_instance_details(instance_id)
+            
+            current_date = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+            ami_name = f"{instance_details['name']}-backup-{current_date}"
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                progress.add_task(description="Creating AMI...", total=None)
+                
+                response = self.ec2.create_image(
+                    InstanceId=instance_id,
+                    Name=ami_name,
+                    Description=f"Backup of {instance_id} created on {current_date}",
+                    NoReboot=True,
+                    TagSpecifications=[{
+                        'ResourceType': 'image',
+                        'Tags': [
+                            {'Key': 'Name', 'Value': ami_name},
+                            {'Key': 'SourceInstance', 'Value': instance_id},
+                            {'Key': 'CreatedBy', 'Value': 'ec2-cli'},
+                            {'Key': 'CreatedAt', 'Value': current_date}
+                        ]
+                    }]
+                )
+                
+                ami_id = response['ImageId']
+                
+                progress.add_task(description="Waiting for AMI to be available...", total=None)
+                waiter = self.ec2.get_waiter('image_available')
+                waiter.wait(
+                    ImageIds=[ami_id],
+                    WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
+                )
+            
+            logger.info(f"Successfully created AMI: {ami_id}")
+            return ami_id
+            
+        except (ClientError, EC2ValidationError) as e:
+            logger.error(f"Failed to create AMI: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error creating AMI: {str(e)}")
+            return None
+
+    def restore_instance(self, ami_identifier: str, instance_type: str) -> Optional[str]:
+        """
+        Create new EC2 instance from AMI
+        
+        Args:
+            ami_identifier: AMI ID or name
+            instance_type: EC2 instance type
+            
+        Returns:
+            Optional[str]: Instance ID if successful, None otherwise
+        """
+        try:
+            ami_id = self.validate_ami_identifier(ami_identifier)
+            self.validate_instance_type(instance_type)
+            
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                transient=True,
+            ) as progress:
+                progress.add_task(description="Launching instance...", total=None)
+                
+                response = self.ec2.run_instances(
+                    ImageId=ami_id,
+                    InstanceType=instance_type,
+                    MinCount=1,
+                    MaxCount=1,
+                    TagSpecifications=[{
+                        'ResourceType': 'instance',
+                        'Tags': [
+                            {'Key': 'CreatedBy', 'Value': 'ec2-cli'},
+                            {'Key': 'SourceAMI', 'Value': ami_id},
+                            {'Key': 'CreatedAt', 'Value': datetime.now().isoformat()}
+                        ]
+                    }]
+                )
+                
+                instance_id = response['Instances'][0]['InstanceId']
+                
+                progress.add_task(description="Waiting for instance to be running...", total=None)
+                waiter = self.ec2.get_waiter('instance_running')
+                waiter.wait(
+                    InstanceIds=[instance_id],
+                    WaiterConfig={'Delay': 15, 'MaxAttempts': 40}
+                )
+            
+            logger.info(f"Successfully launched instance: {instance_id}")
+            return instance_id
+            
+        except (ClientError, EC2ValidationError) as e:
+            logger.error(f"Failed to restore instance: {str(e)}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error restoring instance: {str(e)}")
+            return None
+
+@click.group(name='ec2')
+@click.option('--debug', is_flag=True, help='Enable debug logging')
+def cli(debug):
+    """EC2 backup and restore operations"""
+    if debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug mode enabled")
+
+@cli.command()
+@click.argument('instance-id')
+@click.option('--wait/--no-wait', default=True, help='Wait for AMI to be available')
+def backup(instance_id: str, wait: bool):
+    """Create an AMI backup of an EC2 instance"""
+    try:
+        manager = EC2Manager()
+        ami_id = manager.create_ami(instance_id)
+        
+        if ami_id:
+            result = {
+                'status': 'success',
+                'ami_id': ami_id,
+                'instance_id': instance_id,
+                'timestamp': datetime.now().isoformat()
+            }
+            console.print(json.dumps(result, indent=2))
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Command failed: {str(e)}")
+        sys.exit(1)
+
+@cli.command()
+@click.argument('ami-identifier')
+@click.argument('instance-type')
+@click.option('--wait/--no-wait', default=True, help='Wait for instance to be running')
+def restore(ami_identifier: str, instance_type: str, wait: bool):
+    """Create a new EC2 instance from an AMI"""
+    try:
+        manager = EC2Manager()
+        instance_id = manager.restore_instance(ami_identifier, instance_type)
+        
+        if instance_id:
+            result = {
+                'status': 'success',
+                'instance_id': instance_id,
+                'ami_identifier': ami_identifier,
+                'instance_type': instance_type,
+                'timestamp': datetime.now().isoformat()
+            }
+            console.print(json.dumps(result, indent=2))
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    except Exception as e:
+        logger.error(f"Command failed: {str(e)}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    cli()
